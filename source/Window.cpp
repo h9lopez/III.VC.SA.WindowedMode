@@ -568,9 +568,11 @@ SHORT __stdcall WindowedMode::GetFocusedKeyState(int virtKey)
 {
     // RenderWare polls VK_LSHIFT/VK_RSHIFT through GetKeyState every frame
     // rather than WM_KEYDOWN/WM_KEYUP; report keys as up while unfocused.
+    // Only the pressed bit is dropped: the toggle bit (Caps Lock, Num Lock) stays.
+    auto state = oriGetKeyState(virtKey);
     if (inst && inst->window && !HasFocus(inst->window))
-        return 0;
-    return oriGetKeyState(virtKey);
+        state &= 1;
+    return state;
 }
 
 POINT WindowedMode::SizeFromClient(POINT clientSize) const

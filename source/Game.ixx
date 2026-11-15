@@ -22,88 +22,136 @@ namespace
 
     using GetKeyStateFn = decltype(&::GetKeyState);
 
-    GetKeyStateFn* ResolveKeyStateImport(decltype(&CreateWindowExA)* windowImport)
+    // Looks the import up by name, so a slot another plugin has already replaced
+    // is still found and its hook stays chained behind ours.
+    GetKeyStateFn* FindKeyStateByName()
     {
-        // Resolve through the Import Name Table first so another plugin's earlier IAT
-        // hook on GetKeyState is preserved and chained rather than missed.
-        if (auto base = reinterpret_cast<const uint8_t*>(GetModuleHandleW(nullptr)))
-        {
-            auto dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(base);
-            if (dos->e_magic == IMAGE_DOS_SIGNATURE && dos->e_lfanew > 0)
-            {
-                auto nt = reinterpret_cast<const IMAGE_NT_HEADERS*>(base + dos->e_lfanew);
-                if (nt->Signature == IMAGE_NT_SIGNATURE)
-                {
-                    const auto imageSize = nt->OptionalHeader.SizeOfImage;
-                    const auto& dir = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
-                    if (dir.VirtualAddress && dir.Size >= sizeof(IMAGE_IMPORT_DESCRIPTOR) &&
-                        dir.VirtualAddress + sizeof(IMAGE_IMPORT_DESCRIPTOR) <= imageSize)
-                    {
-                        for (auto desc = reinterpret_cast<const IMAGE_IMPORT_DESCRIPTOR*>(base + dir.VirtualAddress);
-                            reinterpret_cast<const uint8_t*>(desc + 1) <= base + imageSize && desc->Name && desc->FirstThunk;
-                            ++desc)
-                        {
-                            if (!desc->OriginalFirstThunk || desc->Name + 11 > imageSize ||
-                                desc->OriginalFirstThunk >= imageSize || desc->FirstThunk >= imageSize ||
-                                _strnicmp(reinterpret_cast<const char*>(base + desc->Name), "user32.dll", 11) != 0)
-                                continue;
+        auto base = reinterpret_cast<uint8_t*>(GetModuleHandleW(nullptr));
+        auto dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(base);
+        if (!base || dos->e_magic != IMAGE_DOS_SIGNATURE || dos->e_lfanew <= 0)
+            return nullptr;
+        auto nt = reinterpret_cast<const IMAGE_NT_HEADERS*>(base + dos->e_lfanew);
+        if (nt->Signature != IMAGE_NT_SIGNATURE)
+            return nullptr;
 
-                            auto orig = reinterpret_cast<const IMAGE_THUNK_DATA*>(base + desc->OriginalFirstThunk);
-                            auto thunk = reinterpret_cast<IMAGE_THUNK_DATA*>(const_cast<uint8_t*>(base) + desc->FirstThunk);
-                            for (; reinterpret_cast<const uint8_t*>(orig + 1) <= base + imageSize &&
-                                   reinterpret_cast<const uint8_t*>(thunk + 1) <= base + imageSize &&
-                                   orig->u1.AddressOfData; ++orig, ++thunk)
-                            {
-                                if (IMAGE_SNAP_BY_ORDINAL(orig->u1.Ordinal))
-                                    continue;
-                                if (orig->u1.AddressOfData + offsetof(IMAGE_IMPORT_BY_NAME, Name) + 12 > imageSize)
-                                    continue;
-                                auto byName = reinterpret_cast<const IMAGE_IMPORT_BY_NAME*>(base + orig->u1.AddressOfData);
-                                if (std::strncmp(byName->Name, "GetKeyState", 12) == 0)
-                                    return reinterpret_cast<GetKeyStateFn*>(&thunk->u1.Function);
-                            }
-                        }
-                    }
-                }
+        // Packers leave stale RVAs behind, so each one is range checked before use.
+        const size_t imageSize = nt->OptionalHeader.SizeOfImage;
+        auto at = [&](size_t rva, size_t size) -> uint8_t*
+        {
+            return rva && rva <= imageSize && size <= imageSize - rva ? base + rva : nullptr;
+        };
+
+        size_t rva = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT].VirtualAddress;
+        for (;; rva += sizeof(IMAGE_IMPORT_DESCRIPTOR))
+        {
+            auto desc = reinterpret_cast<const IMAGE_IMPORT_DESCRIPTOR*>(at(rva, sizeof(IMAGE_IMPORT_DESCRIPTOR)));
+            if (!desc || !desc->Name || !desc->FirstThunk)
+                return nullptr;
+            auto dll = reinterpret_cast<const char*>(at(desc->Name, sizeof("user32.dll")));
+            if (!dll || _strnicmp(dll, "user32.dll", sizeof("user32.dll")) != 0)
+                continue;
+
+            for (size_t offset = 0;; offset += sizeof(IMAGE_THUNK_DATA))
+            {
+                auto name = reinterpret_cast<const IMAGE_THUNK_DATA*>(at(desc->OriginalFirstThunk + offset, sizeof(IMAGE_THUNK_DATA)));
+                auto slot = reinterpret_cast<IMAGE_THUNK_DATA*>(at(desc->FirstThunk + offset, sizeof(IMAGE_THUNK_DATA)));
+                if (!name || !slot || !name->u1.AddressOfData)
+                    break;
+                if (IMAGE_SNAP_BY_ORDINAL(name->u1.Ordinal))
+                    continue;
+                auto import = reinterpret_cast<const IMAGE_IMPORT_BY_NAME*>(
+                    at(name->u1.AddressOfData, offsetof(IMAGE_IMPORT_BY_NAME, Name) + sizeof("GetKeyState")));
+                if (import && std::strncmp(import->Name, "GetKeyState", sizeof("GetKeyState")) == 0)
+                    return reinterpret_cast<GetKeyStateFn*>(&slot->u1.Function);
             }
         }
+    }
 
-        // Packed/Steam executables hide or replace the PE import directory; scan the
-        // unpacked USER32.dll IAT slice anchored on the resolved CreateWindowExA slot.
-        if (auto user32 = GetModuleHandleW(L"user32.dll"))
+    // Packed/Steam executables hide or replace the PE import directory: scan the
+    // unpacked USER32.dll IAT slice around the resolved CreateWindowExA slot.
+    GetKeyStateFn* FindKeyStateByAddress(decltype(&CreateWindowExA)* windowImport)
+    {
+        auto user32 = GetModuleHandleW(L"user32.dll");
+        auto target = user32 ? reinterpret_cast<GetKeyStateFn>(GetProcAddress(user32, "GetKeyState")) : nullptr;
+        MEMORY_BASIC_INFORMATION mbi{};
+        if (!target || VirtualQuery(windowImport, &mbi, sizeof(mbi)) != sizeof(mbi) || mbi.State != MEM_COMMIT)
+            return nullptr;
+
+        auto begin = static_cast<GetKeyStateFn*>(mbi.BaseAddress);
+        auto end = reinterpret_cast<GetKeyStateFn*>(static_cast<uint8_t*>(mbi.BaseAddress) + mbi.RegionSize);
+        auto slot = reinterpret_cast<GetKeyStateFn*>(windowImport);
+        while (slot > begin && *(slot - 1) != nullptr)
+            --slot;
+        for (; slot < end && *slot != nullptr; ++slot)
         {
-            if (auto target = reinterpret_cast<GetKeyStateFn>(GetProcAddress(user32, "GetKeyState")))
-            {
-                MEMORY_BASIC_INFORMATION mbi{};
-                if (VirtualQuery(windowImport, &mbi, sizeof(mbi)) == sizeof(mbi) && mbi.State == MEM_COMMIT)
-                {
-                    auto begin = static_cast<GetKeyStateFn*>(mbi.BaseAddress);
-                    auto end = reinterpret_cast<GetKeyStateFn*>(static_cast<uint8_t*>(mbi.BaseAddress) + mbi.RegionSize);
-                    auto slot = reinterpret_cast<GetKeyStateFn*>(windowImport);
-                    while (slot > begin && *(slot - 1) != nullptr)
-                        --slot;
-                    for (; slot < end && *slot != nullptr; ++slot)
-                    {
-                        if (*slot == target)
-                            return slot;
-                    }
-                }
-            }
+            if (*slot == target)
+                return slot;
         }
+        return nullptr;
+    }
 
+    // A pattern only proves that something is read or called next to VK_LSHIFT.
+    // Accept the operand only if it is an import slot of the game that can hold
+    // GetKeyState, so a game variable or another import is never overwritten.
+    bool IsKeyStateSlot(GetKeyStateFn* slot)
+    {
+        auto exe = GetModuleHandleW(nullptr);
+        MEMORY_BASIC_INFORMATION mbi{};
+        if (VirtualQuery(slot, &mbi, sizeof(mbi)) != sizeof(mbi) || mbi.State != MEM_COMMIT ||
+            mbi.AllocationBase != exe || (mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD)))
+            return false;
+
+        // The slot has to point at code of another module
+        auto target = *slot;
+        HMODULE owner = nullptr;
+        if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+            reinterpret_cast<LPCWSTR>(target), &owner) || !owner || owner == exe)
+            return false;
+
+        // Inside USER32 it must be the export itself. Anywhere else it is a shim
+        // or another plugin's replacement, which cannot be identified further.
+        auto user32 = GetModuleHandleW(L"user32.dll");
+        return owner != user32 || target == reinterpret_cast<GetKeyStateFn>(GetProcAddress(user32, "GetKeyState"));
+    }
+
+    // Last resort: the operand of the instruction that calls or loads the import
+    // for the VK_LSHIFT poll. Used only if every match agrees on one valid slot.
+    GetKeyStateFn* FindKeyStateByPattern()
+    {
+        GetKeyStateFn* found = nullptr;
+        bool ambiguous = false;
+        auto consider = [&](GetKeyStateFn* slot)
+        {
+            if (!IsKeyStateSlot(slot))
+                return;
+            ambiguous |= found && found != slot;
+            found = slot;
+        };
+
+        // push VK_LSHIFT; call [slot]
         auto direct = hook::pattern("68 A0 00 00 00 FF 15 ? ? ? ?");
-        if (direct.size() == 1)
-            return ReadOperand<GetKeyStateFn*>(direct.get_first(5), 2);
+        for (size_t i = 0; i < direct.size(); ++i)
+            consider(ReadOperand<GetKeyStateFn*>(direct.get(i).get<const uint8_t>(5), 2));
 
+        // mov reg, [slot]; push VK_LSHIFT
         auto reg = hook::pattern("8B ? ? ? ? ? 68 A0 00 00 00");
         for (size_t i = 0; i < reg.size(); ++i)
         {
             auto insn = reg.get(i).get<const uint8_t>();
             if ((insn[1] & 0xC7) == 0x05)
-                return ReadOperand<GetKeyStateFn*>(insn, 2);
+                consider(ReadOperand<GetKeyStateFn*>(insn, 2));
         }
 
-        return nullptr;
+        return ambiguous ? nullptr : found;
+    }
+
+    GetKeyStateFn* ResolveKeyStateImport(decltype(&CreateWindowExA)* windowImport)
+    {
+        if (auto slot = FindKeyStateByName())
+            return slot;
+        if (auto slot = FindKeyStateByAddress(windowImport))
+            return slot;
+        return FindKeyStateByPattern();
     }
 }
 
@@ -135,6 +183,8 @@ export void InitializeGame()
     auto keyStateImport = ResolveKeyStateImport(windowImport);
     if (keyStateImport)
         WindowedMode::oriGetKeyState = *keyStateImport;
+    else
+        OutputDebugStringA("WindowedMode: GetKeyState import not found, Shift can leak into the unfocused game.\n");
 
     controller = std::make_unique<WindowedMode>(game);
     inst = controller.get();
