@@ -564,6 +564,15 @@ LRESULT APIENTRY WindowedMode::WindowProc(HWND wnd, UINT msg, WPARAM wParam, LPA
     return CallWindowProcA(inst->oriWindowProc, wnd, msg, wParam, lParam);
 }
 
+SHORT __stdcall WindowedMode::GetFocusedKeyState(int virtKey)
+{
+    // RenderWare polls VK_LSHIFT/VK_RSHIFT through GetKeyState every frame
+    // rather than WM_KEYDOWN/WM_KEYUP; report keys as up while unfocused.
+    if (inst && inst->window && !HasFocus(inst->window))
+        return 0;
+    return oriGetKeyState(virtKey);
+}
+
 POINT WindowedMode::SizeFromClient(POINT clientSize) const
 {
     auto frame = GetFrameSize();
