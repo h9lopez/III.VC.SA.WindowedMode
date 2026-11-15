@@ -19,6 +19,7 @@ public:
     union{ RsGlobalType* rsGlobal; RsGlobalTypeSA* rsGlobalSA; }; // different in SA
     WNDPROC oriWindowProc = nullptr;
     inline static decltype(&CreateWindowExA) createWindow = &CreateWindowExA;
+    inline static decltype(&::GetKeyState) oriGetKeyState = &::GetKeyState;
     IDirect3DDevice8* d3dDevice = nullptr;
     union{ D3DPRESENT_PARAMETERS* d3dPresentParams8; D3DPRESENT_PARAMETERS_D3D9* d3dPresentParams9; }; // DirectX 8 or 9
     DisplayMode** rwVideoModes; // array
@@ -92,6 +93,7 @@ public:
     DWORD WindowStyleEx() const;
     void WindowUpdateTitle();
     static LRESULT APIENTRY WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam);
+    static SHORT __stdcall GetFocusedKeyState(int virtKey);
     POINT SizeFromClient(POINT clientSize) const;
     POINT ClientFromSize(POINT windowSize) const;
     RECT GetFrameSize(bool paddOnly = false) const; // size of window frame and extra padding/shadow introduced in later versions of Windows
